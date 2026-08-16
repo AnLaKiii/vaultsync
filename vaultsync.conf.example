@@ -1,0 +1,20 @@
+# vaultsync yapılandırması — bu dosyayı "vaultsync.conf" olarak kopyalayıp düzenle.
+# (script bunu kendi yanında ya da ~/.config/vaultsync/config yolunda arar)
+
+# Obsidian vault klasörünün TAM yolu:
+VAULT_DIR="/mnt/d/Notlar/MyVault"
+
+# Git dalı:
+BRANCH="main"
+
+# Özel GitHub deposunun HTTPS adresi (init origin'i buna ayarlar):
+REMOTE_URL="https://github.com/KULLANICI_ADIN/obsidian-vault.git"
+
+# Son değişiklikten kaç saniye sonra commit atılsın:
+DEBOUNCE_SECONDS=30
+
+# Kaç saniyede bir pull yapılsın (300 = 5 dakika):
+PULL_INTERVAL_SECONDS=300
+
+# watch döngüsünün yoklama aralığı (saniye):
+POLL_SECONDS=5

@@ -1,0 +1,14 @@
+[Unit]
+Description=vaultsync - Obsidian vault git senkronizasyonu
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# vaultsync'i ~/.local/bin altına koyduğunu varsayar (bkz. README)
+ExecStart=%h/.local/bin/vaultsync watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

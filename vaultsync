@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# vaultsync — git tabanlı Obsidian vault senkronizasyonu (Obsidian Sync yerine)
+#
+# Alt komutlar:
+#   init     depoyu hazırla (.git, .gitignore, origin, ilk commit)
+#   watch    ön planda çalış: değişiklikleri debounce edip commit+push, 5 dk'da bir pull
+#   sync     tek seferlik: commit + push + pull
+#   commit   şimdi commit (debounce beklemeden)
+#   push     origin'e gönder
+#   pull     origin'den rebase ile çek (çatışmada veri kaybı yok)
+#   status   son push/pull zamanı ve bekleyen çatışma dosyaları
+#
+# Ayarlar: vaultsync.conf (script yanında) veya ~/.config/vaultsync/config
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# yapılandırma
+# ---------------------------------------------------------------------------
+load_config() {
+  local cfg="${VAULTSYNC_CONFIG:-}"
+  if [ -z "$cfg" ]; then
+    if   [ -f "$SELF_DIR/vaultsync.conf" ];        then cfg="$SELF_DIR/vaultsync.conf"
+    elif [ -f "$HOME/.config/vaultsync/config" ];  then cfg="$HOME/.config/vaultsync/config"
+    fi
+  fi
+  [ -n "$cfg" ] && [ -f "$cfg" ] && . "$cfg"
+
+  : "${VAULT_DIR:?VAULT_DIR ayarlanmalı — vaultsync.conf oluştur (bkz. vaultsync.conf.example)}"
+  : "${BRANCH:=main}"
+  : "${REMOTE_URL:=}"
+  : "${DEBOUNCE_SECONDS:=30}"
+  : "${PULL_INTERVAL_SECONDS:=300}"
+  : "${POLL_SECONDS:=5}"
+
+  VAULT_DIR="${VAULT_DIR/#\~/$HOME}"
+
+  # token için .env (opsiyonel) — önce vault, sonra script dizini
+  local envf=""
+  if   [ -f "$VAULT_DIR/.env" ]; then envf="$VAULT_DIR/.env"
+  elif [ -f "$SELF_DIR/.env" ];  then envf="$SELF_DIR/.env"
+  fi
+  if [ -n "$envf" ]; then set -a; . "$envf"; set +a; fi
+
+  STATE_DIR="$VAULT_DIR/.git/vaultsync"
+  LOG="$STATE_DIR/vaultsync.log"
+  case "$(uname -s)" in Darwin) OS=Darwin ;; *) OS=Linux ;; esac
+}
+
+g() { git -C "$VAULT_DIR" "$@"; }
+
+vlog() {
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG" >&2
+}
+
+# token varsa: git config'e yazmadan GIT_ASKPASS ile kimlik ver
+setup_auth() {
+  [ -n "${GITHUB_TOKEN:-}" ] || return 0
+  mkdir -p "$STATE_DIR"
+  local ap="$STATE_DIR/askpass.sh"
+  cat > "$ap" <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  *[Uu]sername*) echo "${GITHUB_USER:-x-access-token}" ;;
+  *)             echo "${GITHUB_TOKEN}" ;;
+esac
+EOS
+  chmod +x "$ap"
+  export GIT_ASKPASS="$ap"
+  export GITHUB_USER="${GITHUB_USER:-x-access-token}" GITHUB_TOKEN
+}
+
+ensure_repo() {
+  [ -d "$VAULT_DIR/.git" ] || { echo "Hata: $VAULT_DIR bir git deposu değil. Önce: vaultsync init" >&2; exit 1; }
+  g config user.email >/dev/null 2>&1 || g config user.email "vaultsync@$(hostname)"
+  g config user.name  >/dev/null 2>&1 || g config user.name  "vaultsync ($(hostname))"
+  mkdir -p "$STATE_DIR"
+}
+
+has_origin() { g remote 2>/dev/null | grep -q '^origin$'; }
+
+touch_push() { date +%s > "$STATE_DIR/last-push"; }
+touch_pull() { date +%s > "$STATE_DIR/last-pull"; }
+read_ts()    { [ -f "$1" ] && cat "$1" || echo ""; }
+fmt_ts() {
+  local s="$1"; [ -z "$s" ] && { echo "hiç"; return; }
+  if [ "$OS" = Darwin ]; then date -r "$s" '+%Y-%m-%d %H:%M:%S'
+  else date -d "@$s" '+%Y-%m-%d %H:%M:%S'; fi
+}
+
+is_dirty() { [ -n "$(g status --porcelain)" ]; }
+
+# vault içindeki en yeni dosyanın epoch zamanı (.git hariç)
+newest_mtime() {
+  if [ "$OS" = Linux ]; then
+    find "$VAULT_DIR" -name .git -prune -o -type f -printf '%T@\n' 2>/dev/null \
+      | sort -n | tail -1 | cut -d. -f1
+  else
+    local newest=0 t
+    while IFS= read -r -d '' f; do
+      t="$(stat -f %m "$f" 2>/dev/null)" || continue
+      [ "$t" -gt "$newest" ] && newest="$t"
+    done < <(find "$VAULT_DIR" -name .git -prune -o -type f -print0 2>/dev/null)
+    echo "$newest"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# commit / push / pull
+# ---------------------------------------------------------------------------
+commit_if_ready() {
+  is_dirty || return 1
+  local newest now
+  newest="$(newest_mtime)"; [ -z "$newest" ] && newest=0
+  now="$(date +%s)"
+  [ $(( now - newest )) -lt "$DEBOUNCE_SECONDS" ] && return 1   # hâlâ yazılıyor, bekle
+  g add -A
+  local msg="vault sync $(date '+%Y-%m-%d %H:%M:%S') @ $(hostname)"
+  if g commit -q -m "$msg"; then vlog "commit: $msg"; return 0; fi
+  return 1
+}
+
+do_push() {
+  has_origin || return 0
+  if g push -q origin "$BRANCH" 2>>"$LOG"; then
+    touch_push; return 0
+  else
+    vlog "push BAŞARISIZ (ağ / kimlik doğrulama?)"; return 1
+  fi
+}
+
+do_pull() {
+  has_origin || return 0
+  if ! g fetch -q origin "$BRANCH" 2>>"$LOG"; then vlog "fetch BAŞARISIZ"; return 1; fi
+  g rev-parse --verify -q "origin/$BRANCH" >/dev/null || { touch_pull; return 0; }
+
+  local loc rem base
+  loc="$(g rev-parse HEAD)"
+  rem="$(g rev-parse "origin/$BRANCH")"
+  base="$(g merge-base HEAD "origin/$BRANCH")"
+  # zaten güncel, ya da sadece biz öndeyiz → çekilecek bir şey yok
+  if [ "$loc" = "$rem" ] || [ "$rem" = "$base" ]; then touch_pull; return 0; fi
+
+  if g rebase -q "origin/$BRANCH" 2>>"$LOG"; then
+    vlog "pull (rebase) tamam"; touch_pull; return 0
+  fi
+  resolve_rebase_conflicts
+  touch_pull
+}
+
+# rebase çatışması: gelen sürümü <ad>.conflict-TARIH.md olarak sakla, benimkini koru
+resolve_rebase_conflicts() {
+  local guard=0 date; date="$(date '+%Y-%m-%d')"
+  while [ -d "$VAULT_DIR/.git/rebase-merge" ] || [ -d "$VAULT_DIR/.git/rebase-apply" ]; do
+    guard=$(( guard + 1 ))
+    if [ "$guard" -gt 200 ]; then vlog "rebase döngüsü takıldı — iptal"; g rebase --abort 2>/dev/null; break; fi
+
+    local files; files="$(g diff --name-only --diff-filter=U)"
+    if [ -n "$files" ]; then
+      while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        local base_name target
+        case "$f" in *.md) base_name="${f%.md}" ;; *) base_name="$f" ;; esac
+        target="${base_name}.conflict-${date}.md"
+        [ -e "$VAULT_DIR/$target" ] && target="${base_name}.conflict-${date}-$(date '+%H%M%S').md"
+
+        # gelen (uzak) sürümü sakla
+        if g cat-file -e "origin/$BRANCH:$f" 2>/dev/null; then
+          g show "origin/$BRANCH:$f" > "$VAULT_DIR/$target" 2>/dev/null || true
+        fi
+        # benimkini yerinde tut (rebase'de benim commit'im = --theirs)
+        g checkout --theirs -- "$f" 2>/dev/null || g checkout --ours -- "$f" 2>/dev/null || true
+        g add -- "$f" 2>/dev/null || true
+        [ -e "$VAULT_DIR/$target" ] && g add -- "$target" 2>/dev/null || true
+        vlog "ÇATIŞMA: $f → benimki korundu, gelen sürüm: $target"
+      done <<< "$files"
+    fi
+
+    GIT_EDITOR=true g rebase --continue 2>>"$LOG" || continue
+  done
+}
+
+# ---------------------------------------------------------------------------
+# komutlar
+# ---------------------------------------------------------------------------
+cmd_init() {
+  mkdir -p "$VAULT_DIR"
+  if [ ! -d "$VAULT_DIR/.git" ]; then
+    g init -q -b "$BRANCH" 2>/dev/null || { g init -q; g checkout -q -b "$BRANCH" 2>/dev/null || true; }
+  fi
+  ensure_repo
+
+  local gi="$VAULT_DIR/.gitignore"
+  if [ ! -f "$gi" ]; then
+    printf '%s\n' '.obsidian/workspace*' '.trash/' > "$gi"
+    vlog ".gitignore oluşturuldu (workspace* ve .trash yoksayıldı)"
+  fi
+
+  if [ -n "$REMOTE_URL" ]; then
+    if has_origin; then g remote set-url origin "$REMOTE_URL"; else g remote add origin "$REMOTE_URL"; fi
+    vlog "origin = $REMOTE_URL"
+  fi
+
+  if is_dirty; then
+    g add -A; g commit -q -m "vaultsync ilk commit @ $(hostname)"; vlog "ilk commit oluşturuldu"
+  fi
+  echo "init tamam. Sonraki adım:  vaultsync push   (ardından)  vaultsync watch"
+}
+
+cmd_watch() {
+  vlog "watcher başladı: $VAULT_DIR (debounce ${DEBOUNCE_SECONDS}s, pull ${PULL_INTERVAL_SECONDS}s)"
+  trap 'vlog "watcher durduruldu"; exit 0' INT TERM
+  do_pull; do_push
+  local last_pull; last_pull="$(date +%s)"
+  while true; do
+    commit_if_ready && do_push
+    local now; now="$(date +%s)"
+    if [ $(( now - last_pull )) -ge "$PULL_INTERVAL_SECONDS" ]; then
+      do_pull; do_push; last_pull="$now"
+    fi
+    sleep "$POLL_SECONDS"
+  done
+}
+
+cmd_status() {
+  ensure_repo
+  echo "Vault:      $VAULT_DIR"
+  echo "Dal:        $BRANCH"
+  has_origin && echo "Origin:     $(g remote get-url origin 2>/dev/null)" || echo "Origin:     (ayarlı değil)"
+  local lastcommit
+  lastcommit="$(g log -1 --format='%cd  %h  %s' --date=format:'%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+  echo "Son commit: ${lastcommit:-yok}"
+  echo "Son push:   $(fmt_ts "$(read_ts "$STATE_DIR/last-push")")"
+  echo "Son pull:   $(fmt_ts "$(read_ts "$STATE_DIR/last-pull")")"
+  if is_dirty; then echo "Çalışma alanı: DEĞİŞİKLİK VAR (commit bekliyor)"; else echo "Çalışma alanı: temiz"; fi
+  if g rev-parse --verify -q "origin/$BRANCH" >/dev/null 2>&1; then
+    local ab; ab="$(g rev-list --left-right --count "HEAD...origin/$BRANCH" 2>/dev/null)"
+    echo "Önde / geride (origin'e göre): ${ab:-?}"
+  fi
+  local conflicts
+  conflicts="$(find "$VAULT_DIR" -path "$VAULT_DIR/.git" -prune -o -name '*.conflict-*.md' -print 2>/dev/null | sort)"
+  if [ -n "$conflicts" ]; then
+    echo "Çözülmemiş çatışma dosyaları:"
+    echo "$conflicts" | sed "s|^$VAULT_DIR/|  - |"
+  else
+    echo "Çatışma dosyası yok."
+  fi
+}
+
+usage() {
+  cat >&2 <<EOF
+vaultsync — git tabanlı Obsidian vault senkronizasyonu
+
+Kullanım: vaultsync <komut>
+
+  init     depoyu hazırla (.git, .gitignore, origin, ilk commit)
+  watch    ön planda çalış: debounce'lu commit+push, 5 dk'da bir pull
+  sync     tek seferlik commit + push + pull
+  commit   şimdi commit et (debounce beklemeden)
+  push     origin'e gönder
+  pull     origin'den rebase ile çek (çatışmada veri kaybı yok)
+  status   son push/pull zamanı ve bekleyen çatışma dosyaları
+
+Ayar dosyası: vaultsync.conf (bkz. vaultsync.conf.example)
+EOF
+}
+
+main() {
+  load_config
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    init)   setup_auth; cmd_init ;;
+    watch)  ensure_repo; setup_auth; cmd_watch ;;
+    sync)   ensure_repo; setup_auth
+            if is_dirty; then g add -A; g commit -q -m "vault sync $(date '+%Y-%m-%d %H:%M:%S') @ $(hostname)"; vlog "commit (sync)"; fi
+            do_push; do_pull; do_push ;;
+    commit) ensure_repo
+            if is_dirty; then g add -A; g commit -q -m "vault sync $(date '+%Y-%m-%d %H:%M:%S') @ $(hostname)"; echo "commit edildi"; else echo "değişiklik yok"; fi ;;
+    push)   ensure_repo; setup_auth; do_push ;;
+    pull)   ensure_repo; setup_auth; do_pull; do_push ;;
+    status) cmd_status ;;
+    ""|-h|--help|help) usage ;;
+    *) echo "Bilinmeyen komut: $cmd" >&2; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
